@@ -1,0 +1,21 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'com.fastbug.captureagent'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId 'com.fastbug.captureagent'
+        minSdk 26
+        targetSdk 34
+        versionCode 1
+        versionName '0.1.0-poc'
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+}
