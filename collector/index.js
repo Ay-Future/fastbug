@@ -14,9 +14,10 @@ const { status: yunxiaoStatus, listProjectOptions, createWorkitem, updateWorkite
 const { uploadEvidencePackage } = require('./oss');
 const execFileAsync = promisify(execFile);
 
-const ROOT = path.resolve(__dirname, '..', 'collector-data');
+const ROOT = path.resolve(__dirname, '..', '..', 'collector-data');
 const PORT = 52741;
 const MAX_LOG_BYTES = 12 * 1024 * 1024;
+const REQUIRED_RUNTIME_ENV = ['YUNXIAO_TOKEN', 'FASTBUG_OSS_ENDPOINT', 'FASTBUG_OSS_ACCESS_KEY_ID', 'FASTBUG_OSS_ACCESS_KEY_SECRET'];
 
 function options(argv) {
   const value = name => { const i = argv.indexOf(name); return i >= 0 ? argv[i + 1] : undefined; };
@@ -24,6 +25,12 @@ function options(argv) {
 }
 function usage() {
   console.log('Usage: node collector/index.js start --serial <adb serial> --package <app package> [--session <id>]');
+}
+function validateRuntimeEnvironment() {
+  const missing = REQUIRED_RUNTIME_ENV.filter(name => !String(process.env[name] || '').trim());
+  if (missing.length) {
+    throw new Error(`Collector 启动失败：当前进程缺少用户环境变量 ${missing.join('、')}。请使用 collector\\start.ps1 启动，或先将这些变量注入当前终端。`);
+  }
 }
 function safeId(value) {
   if (!/^cap_[a-zA-Z0-9]+$/.test(value || '')) throw new Error('Invalid captureId');
@@ -168,7 +175,7 @@ class Collector {
           triggeredAt: manifest.trigger?.triggeredAtWallMs,
           status: manifest.status,
           draftStatus: draft?.status || 'not_ready',
-          yunxiaoStatus: draft?.submission?.state === 'submitted' ? 'submitted' : 'not_submitted',
+        yunxiaoStatus: draft?.submission?.state || 'not_submitted',
           title: draft?.title || '草稿尚未生成',
           progress: { stage: 'complete', label: '证据已就绪' }
         });
@@ -190,7 +197,7 @@ class Collector {
       const dir = this.captureDirectory(folder);
       const draftFile = path.join(dir, 'draft', 'draft.json');
       const draft = JSON.parse(await fsp.readFile(draftFile, 'utf8'));
-      for (const field of ['title', 'reproductionSteps', 'expectedResult', 'actualResult', 'severity', 'module', 'assignee', 'assigneeId', 'application', 'testerNote']) {
+      for (const field of ['title', 'reproductionSteps', 'expectedResult', 'actualResult', 'severity', 'module', 'assignee', 'assigneeId', 'application', 'verifier', 'verifierId', 'participants', 'participantIds', 'testerNote']) {
         if (Object.prototype.hasOwnProperty.call(update, field)) draft[field] = update[field];
       }
       draft.status = 'confirmed_locally';
@@ -228,11 +235,24 @@ class Collector {
     }
   }
   async submitYunxiao(res, folder) {
+    let draft;
+    let draftFile;
+    let dir;
+    let submissionStarted = false;
     try {
-      const dir = this.captureDirectory(folder);
-      const draftFile = path.join(dir, 'draft', 'draft.json');
-      const draft = JSON.parse(await fsp.readFile(draftFile, 'utf8'));
+      dir = this.captureDirectory(folder);
+      draftFile = path.join(dir, 'draft', 'draft.json');
+      draft = JSON.parse(await fsp.readFile(draftFile, 'utf8'));
       if (draft.status !== 'confirmed_locally') throw new Error('请先保存并确认本地草稿，再创建云效缺陷。');
+      const alreadySubmitted = draft.submission?.state === 'submitted';
+      draft.submission = {
+        ...(draft.submission || {}),
+        state: 'submitting',
+        startedAt: iso(),
+        lastError: null
+      };
+      submissionStarted = true;
+      await Promise.all([writeJson(draftFile, draft), fsp.writeFile(path.join(dir, 'draft', 'draft.md'), draftMarkdown(draft), 'utf8')]);
       if (!draft.evidenceUpload?.downloadUrl || new Date(draft.evidenceUpload.expiresAt) <= new Date()) {
         draft.evidenceUpload = { ...(await uploadEvidencePackage(dir, folder)), uploadedAt: iso() };
       }
@@ -241,10 +261,9 @@ class Collector {
         draft.actualResult = String(draft.actualResult).replace(evidenceLine, '').replace(/\n{3,}/g, '\n\n').trim();
       }
       await Promise.all([writeJson(draftFile, draft), fsp.writeFile(path.join(dir, 'draft', 'draft.md'), draftMarkdown(draft), 'utf8')]);
-      const alreadySubmitted = draft.submission?.state === 'submitted';
       const submission = alreadySubmitted ? await updateWorkitem(draft) : await createWorkitem(draft);
       draft.submission = {
-        ...(alreadySubmitted ? draft.submission : {}),
+        ...(draft.submission || {}),
         state: 'submitted',
         submittedAt: alreadySubmitted ? draft.submission.submittedAt : iso(),
         syncedAt: iso(),
@@ -252,7 +271,13 @@ class Collector {
       };
       await Promise.all([writeJson(draftFile, draft), fsp.writeFile(path.join(dir, 'draft', 'draft.md'), draftMarkdown(draft), 'utf8')]);
       this.json(res, 200, { ok: true, action: alreadySubmitted ? 'updated' : 'created', submission: draft.submission });
-    } catch (error) { this.json(res, 400, { ok: false, error: error.message }); }
+    } catch (error) {
+      if (submissionStarted && draft && draftFile && dir) {
+        draft.submission = { ...(draft.submission || {}), state: 'submission_failed', failedAt: iso(), lastError: error.message };
+        await Promise.allSettled([writeJson(draftFile, draft), fsp.writeFile(path.join(dir, 'draft', 'draft.md'), draftMarkdown(draft), 'utf8')]);
+      }
+      this.json(res, 400, { ok: false, error: error.message });
+    }
   }
   async uploadOss(res, folder) {
     try {
@@ -421,7 +446,7 @@ class Collector {
         uiXml: 'raw/ui.xml',
         manifest: 'manifest/manifest.json'
       },
-      manualFields: ['title', 'reproductionSteps', 'expectedResult', 'severity', 'module', 'assignee', 'testerNote'],
+      manualFields: ['title', 'reproductionSteps', 'expectedResult', 'severity', 'module', 'assignee', 'verifier', 'participants', 'testerNote'],
       submission: { state: 'not_submitted', target: null }
     };
     await Promise.all([
@@ -460,6 +485,8 @@ function draftMarkdown(draft) {
       `- 应用：${draft.application || '待确认'}`,
       `- 模块：${draft.module || '待确认'}`,
       `- 指派人：${draft.assignee || '待确认'}`,
+      `- 验证者：${draft.verifier || '待确认'}`,
+      `- 参与者：${(draft.participants || []).join('、') || '待确认'}`,
       `- 测试人员说明：${draft.testerNote || '待补充'}`, ''
     ].join('\n');
 }
@@ -467,11 +494,11 @@ function draftMarkdown(draft) {
 function dashboardHtml() {
   return String.raw`<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>FastBug · 缺陷草稿</title>
 <style>
-:root{--ink:#172033;--muted:#708097;--line:#e5eaf1;--navy:#111c32;--blue:#356dff;--blue-pale:#edf3ff;--bg:#f4f6fa;--surface:#fff;--shadow:0 14px 40px rgba(25,43,76,.08)}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.55 Inter,"Microsoft YaHei",system-ui,sans-serif}.topbar{height:72px;background:linear-gradient(110deg,#101a2e,#1c3157);color:#fff;display:flex;align-items:center;justify-content:space-between;padding:0 max(28px,calc((100vw - 1420px)/2));box-shadow:0 2px 12px #111a2a33}.brand{display:flex;gap:13px;align-items:center}.brand-mark{width:34px;height:34px;border-radius:10px;background:linear-gradient(135deg,#75a5ff,#3165ff);display:grid;place-items:center;font-weight:800;font-size:18px}.brand h1{font-size:17px;letter-spacing:.2px;margin:0}.brand small{display:block;margin-top:1px;color:#bfcce2}.local{color:#c9d6ee;font-size:12px}.local i{display:inline-block;width:7px;height:7px;border-radius:50%;background:#65db9c;margin-right:7px}.workspace{max-width:1420px;margin:0 auto;padding:24px;display:grid;grid-template-columns:340px minmax(0,1fr);gap:22px}.panel{background:var(--surface);border:1px solid var(--line);box-shadow:var(--shadow);border-radius:16px}.sidebar{padding:18px;height:calc(100vh - 120px);min-height:600px;position:sticky;top:18px;overflow:auto;user-select:none;-webkit-user-select:none}.panel-head{display:flex;align-items:center;justify-content:space-between;margin:2px 2px 15px}.panel-head h2{font-size:15px;margin:0}.counter{background:var(--blue-pale);color:#3565d9;padding:3px 8px;border-radius:999px;font-size:12px;font-weight:700}.capture{border:1px solid transparent;border-radius:12px;padding:13px 12px;margin:7px 0;cursor:pointer;transition:.16s ease}.capture:hover{background:#f8faff;border-color:#e5ecff}.capture.active{background:var(--blue-pale);border-color:#adc6ff;box-shadow:inset 3px 0 var(--blue)}.capture-title{font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.capture-meta{margin-top:5px;color:var(--muted);font-size:12px}.capture-tags{display:flex;gap:5px;flex-wrap:wrap;margin-bottom:5px}.tag{display:inline-block;font-size:11px;color:#2d65d8;background:#e8f0ff;border-radius:5px;padding:1px 6px}.tag.yunxiao{color:#248954;background:#e8f8ef}.tag.pending{color:#8a6270;background:#f4eef0}.capture-directory{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.empty{color:var(--muted);text-align:center;padding:44px 10px}.content{min-width:0}.draft-shell{padding:28px 30px}.draft-top{display:flex;justify-content:space-between;align-items:flex-start;border-bottom:1px solid var(--line);padding-bottom:21px;margin-bottom:24px}.draft-top h2{margin:0;font-size:21px;letter-spacing:-.2px}.draft-id{margin-top:6px;color:var(--muted);font-size:12px}.evidence{display:flex;gap:8px;flex-wrap:wrap}.evidence a{color:#2a5ed8;text-decoration:none;border:1px solid #d9e4ff;background:#f7f9ff;padding:7px 10px;border-radius:8px;font-size:12px;font-weight:600}.evidence a:hover{background:#edf3ff}.section-label{font-size:12px;font-weight:800;letter-spacing:.8px;color:#7a899d;text-transform:uppercase;margin:23px 0 9px}label{display:block;font-weight:700;color:#31405a}label span{font-weight:400;color:var(--muted);margin-left:5px}input,textarea,select{display:block;width:100%;margin-top:7px;border:1px solid #d7dfeb;border-radius:9px;padding:10px 12px;background:#fff;color:var(--ink);font:inherit;outline:none;transition:border .15s,box-shadow .15s}input:focus,textarea:focus,select:focus{border-color:#7498ff;box-shadow:0 0 0 3px #dfe9ff}textarea{resize:vertical;min-height:94px}.title-input{font-size:16px;font-weight:650}.grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}.grid.three{grid-template-columns:1fr 1fr 1fr}.savebar{position:sticky;bottom:0;margin:26px -30px -28px;padding:16px 30px;background:#ffffffed;backdrop-filter:blur(8px);border-top:1px solid var(--line);display:flex;gap:12px;align-items:center}.savebar button{border:0;border-radius:9px;padding:11px 18px;background:linear-gradient(135deg,#4478ff,#2559e5);color:white;font:700 14px inherit;cursor:pointer;box-shadow:0 5px 13px #2e61d93d}.savebar button:hover{filter:brightness(1.05)}.saved{color:#2e9b63;font-size:12px}.welcome{padding:48px;min-height:520px;display:grid;place-content:center;text-align:center}.welcome-icon{width:58px;height:58px;border-radius:17px;background:var(--blue-pale);color:#356dff;display:grid;place-items:center;font-size:27px;margin:auto}.welcome h2{margin:16px 0 7px;font-size:20px}.welcome p{margin:0;color:var(--muted);max-width:360px}@media(max-width:850px){.workspace{padding:12px;grid-template-columns:1fr}.sidebar{height:auto;min-height:0;position:static}.draft-shell{padding:20px}.savebar{margin:22px -20px -20px;padding:14px 20px}.topbar{padding:0 16px}.local{display:none}.grid,.grid.three{grid-template-columns:1fr}.draft-top{gap:14px;flex-direction:column}}
+:root{--ink:#172033;--muted:#708097;--line:#e5eaf1;--navy:#111c32;--blue:#356dff;--blue-pale:#edf3ff;--bg:#f4f6fa;--surface:#fff;--shadow:0 14px 40px rgba(25,43,76,.08)}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.55 Inter,"Microsoft YaHei",system-ui,sans-serif}.topbar{height:72px;background:linear-gradient(110deg,#101a2e,#1c3157);color:#fff;display:flex;align-items:center;justify-content:space-between;padding:0 max(28px,calc((100vw - 1420px)/2));box-shadow:0 2px 12px #111a2a33}.brand{display:flex;gap:13px;align-items:center}.brand-mark{width:34px;height:34px;border-radius:10px;background:linear-gradient(135deg,#75a5ff,#3165ff);display:grid;place-items:center;font-weight:800;font-size:18px}.brand h1{font-size:17px;letter-spacing:.2px;margin:0}.brand small{display:block;margin-top:1px;color:#bfcce2}.local{color:#c9d6ee;font-size:12px}.local i{display:inline-block;width:7px;height:7px;border-radius:50%;background:#65db9c;margin-right:7px}.workspace{max-width:1420px;margin:0 auto;padding:24px;display:grid;grid-template-columns:340px minmax(0,1fr);gap:22px}.panel{background:var(--surface);border:1px solid var(--line);box-shadow:var(--shadow);border-radius:16px}.sidebar{padding:18px;height:calc(100vh - 120px);min-height:600px;position:sticky;top:18px;overflow:auto;user-select:none;-webkit-user-select:none}.panel-head{display:flex;align-items:center;justify-content:space-between;margin:2px 2px 15px}.panel-head h2{font-size:15px;margin:0}.counter{background:var(--blue-pale);color:#3565d9;padding:3px 8px;border-radius:999px;font-size:12px;font-weight:700}.capture{border:1px solid transparent;border-radius:12px;padding:13px 12px;margin:7px 0;cursor:pointer;transition:.16s ease}.capture:hover{background:#f8faff;border-color:#e5ecff}.capture.active{background:var(--blue-pale);border-color:#adc6ff;box-shadow:inset 3px 0 var(--blue)}.capture-title{font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.capture-meta{margin-top:5px;color:var(--muted);font-size:12px}.capture-tags{display:flex;gap:5px;flex-wrap:wrap;margin-bottom:5px}.tag{display:inline-block;font-size:11px;color:#2d65d8;background:#e8f0ff;border-radius:5px;padding:1px 6px}.tag.yunxiao{color:#248954;background:#e8f8ef}.tag.submitting{color:#9a6700;background:#fff4d6}.tag.failed{color:#c4453f;background:#fff0ef}.tag.pending{color:#8a6270;background:#f4eef0}.capture-directory{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.empty{color:var(--muted);text-align:center;padding:44px 10px}.content{min-width:0}.draft-shell{padding:28px 30px}.draft-top{display:flex;justify-content:space-between;align-items:flex-start;border-bottom:1px solid var(--line);padding-bottom:21px;margin-bottom:24px}.draft-top h2{margin:0;font-size:21px;letter-spacing:-.2px}.draft-id{margin-top:6px;color:var(--muted);font-size:12px}.evidence{display:flex;gap:8px;flex-wrap:wrap}.evidence a{color:#2a5ed8;text-decoration:none;border:1px solid #d9e4ff;background:#f7f9ff;padding:7px 10px;border-radius:8px;font-size:12px;font-weight:600}.evidence a:hover{background:#edf3ff}.section-label{font-size:12px;font-weight:800;letter-spacing:.8px;color:#7a899d;text-transform:uppercase;margin:23px 0 9px}label{display:block;font-weight:700;color:#31405a}label span{font-weight:400;color:var(--muted);margin-left:5px}input,textarea,select{display:block;width:100%;margin-top:7px;border:1px solid #d7dfeb;border-radius:9px;padding:10px 12px;background:#fff;color:var(--ink);font:inherit;outline:none;transition:border .15s,box-shadow .15s}input:focus,textarea:focus,select:focus{border-color:#7498ff;box-shadow:0 0 0 3px #dfe9ff}textarea{resize:vertical;min-height:94px}.title-input{font-size:16px;font-weight:650}.grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}.grid.three{grid-template-columns:1fr 1fr 1fr}.savebar{position:sticky;bottom:0;margin:26px -30px -28px;padding:16px 30px;background:#ffffffed;backdrop-filter:blur(8px);border-top:1px solid var(--line);display:flex;gap:12px;align-items:center}.savebar button{border:0;border-radius:9px;padding:11px 18px;background:linear-gradient(135deg,#4478ff,#2559e5);color:white;font:700 14px inherit;cursor:pointer;box-shadow:0 5px 13px #2e61d93d}.savebar button:hover{filter:brightness(1.05)}.saved{color:#2e9b63;font-size:12px}.welcome{padding:48px;min-height:520px;display:grid;place-content:center;text-align:center}.welcome-icon{width:58px;height:58px;border-radius:17px;background:var(--blue-pale);color:#356dff;display:grid;place-items:center;font-size:27px;margin:auto}.welcome h2{margin:16px 0 7px;font-size:20px}.welcome p{margin:0;color:var(--muted);max-width:360px}@media(max-width:850px){.workspace{padding:12px;grid-template-columns:1fr}.sidebar{height:auto;min-height:0;position:static}.draft-shell{padding:20px}.savebar{margin:22px -20px -20px;padding:14px 20px}.topbar{padding:0 16px}.local{display:none}.grid,.grid.three{grid-template-columns:1fr}.draft-top{gap:14px;flex-direction:column}}
 @media(max-width:850px){.sidebar{max-height:300px;overflow:auto}}.connection{max-width:1420px;margin:20px auto -2px;padding:16px 20px;display:flex;align-items:center;gap:22px}.connection-title{font-weight:800}.connection-title small{display:block;margin-top:2px;color:var(--muted);font-weight:400}.connection-detail{min-width:0;display:flex;gap:14px;align-items:center;flex:1;color:#526177;font-size:12px}.connection-detail span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.connection code{font:12px ui-monospace,Consolas,monospace;color:#33415b}.connection-state{padding:4px 9px;border-radius:99px;background:#fff0ef;color:#c4453f;font-size:12px;font-weight:700;white-space:nowrap}.connection-state.ok{background:#e8f8ef;color:#248954}.connection button{border:1px solid #d7dfeb;border-radius:8px;background:#fff;padding:7px 10px;color:#40516d;cursor:pointer;font:600 12px inherit;white-space:nowrap}@media(max-width:850px){.connection{margin:12px;padding:14px;display:grid;gap:8px}.connection-detail{display:grid;gap:4px}.connection button{width:max-content}}</style>
 <header class="topbar"><div class="brand"><div class="brand-mark">F</div><div><h1>FastBug</h1><small>本地缺陷草稿工作台</small></div></div><div class="local"><i></i>仅在当前电脑保存证据</div></header>
 <section class="panel connection"><div class="connection-title">设备连接<small>ADB USB · Collector 本机服务</small></div><span class="connection-state" id="connectionState">检查中…</span><div class="connection-detail"><span id="connectionDevice">设备：—</span><span>会话 ID：<code id="connectionSession">—</code></span></div><button type="button" id="refreshConnection">刷新状态</button></section>
-<main class="workspace"><aside class="panel sidebar"><div class="panel-head"><h2>捕获记录</h2><span class="counter" id="count">—</span></div><div id="list"><div class="empty">正在同步捕获记录…</div></div></aside><section class="content"><form class="panel draft-shell" id="editor" hidden><div class="draft-top"><div><h2 id="heading">缺陷草稿</h2><div class="draft-id" id="meta"></div></div><div class="evidence"><a id="video" target="_blank">▶ 查看录像</a><a id="shot" target="_blank">▣ 截图</a><a id="logs" target="_blank">⌁ 日志</a></div></div><div class="section-label">问题描述</div><label>缺陷标题<input class="title-input" id="title" placeholder="例如：支付成功后订单状态未刷新" required></label><div class="grid"><label>预期结果<textarea id="expected" placeholder="应该发生什么？"></textarea></label><label>实际结果<textarea id="actual" placeholder="实际观察到了什么？"></textarea></label></div><label class="section-label">复现步骤 <span>每行一步</span><textarea id="steps" placeholder="1. 进入订单页&#10;2. 完成支付&#10;3. 观察订单状态"></textarea></label><div class="section-label">云效必填字段</div><div class="grid three"><label>应用 <span>输入关键词筛选</span><input id="applicationQuery" list="applicationOptions" placeholder="输入应用名称" autocomplete="off" required><input id="application" type="hidden"><datalist id="applicationOptions"></datalist></label><label>严重程度<select id="severity"><option value="">待确认</option><option>致命</option><option>严重</option><option>一般</option><option>轻微</option></select></label><label>负责人 <span>输入姓名筛选</span><input id="assigneeQuery" list="assigneeOptions" placeholder="输入负责人姓名" autocomplete="off" required><input id="assignee" type="hidden"><datalist id="assigneeOptions"></datalist></label></div><div class="section-label">路由与补充</div><label>模块<input id="module" placeholder="例如：订单中心"></label><label>测试说明<textarea id="note" placeholder="补充环境、测试账号或其他线索"></textarea></label><div class="savebar"><button>保存本地草稿</button><button type="button" class="submit-yunxiao" id="submitYunxiao">提交到云效</button><span class="saved" id="saved"></span></div></form><div class="panel welcome" id="hint"><div><div class="welcome-icon">✦</div><h2>从一条捕获开始</h2><p>选择左侧记录，依据录像、截图和日志补全缺陷草稿。保存后可随时继续编辑。</p></div></div></section></main>
+<main class="workspace"><aside class="panel sidebar"><div class="panel-head"><h2>捕获记录</h2><span class="counter" id="count">—</span></div><div id="list"><div class="empty">正在同步捕获记录…</div></div></aside><section class="content"><form class="panel draft-shell" id="editor" hidden><div class="draft-top"><div><h2 id="heading">缺陷草稿</h2><div class="draft-id" id="meta"></div></div><div class="evidence"><a id="video" target="_blank">▶ 查看录像</a><a id="shot" target="_blank">▣ 截图</a><a id="logs" target="_blank">⌁ 日志</a></div></div><div class="section-label">问题描述</div><label>缺陷标题<input class="title-input" id="title" placeholder="例如：支付成功后订单状态未刷新" required></label><div class="grid"><label>预期结果<textarea id="expected" placeholder="应该发生什么？"></textarea></label><label>实际结果<textarea id="actual" placeholder="实际观察到了什么？"></textarea></label></div><label class="section-label">复现步骤 <span>每行一步</span><textarea id="steps" placeholder="1. 进入订单页&#10;2. 完成支付&#10;3. 观察订单状态"></textarea></label><div class="section-label">云效必填字段</div><div class="grid three"><label>应用 <span>输入关键词筛选</span><input id="applicationQuery" list="applicationOptions" placeholder="输入应用名称" autocomplete="off" required><input id="application" type="hidden"><datalist id="applicationOptions"></datalist></label><label>严重程度<select id="severity"><option value="">待确认</option><option>致命</option><option>严重</option><option>一般</option><option>轻微</option></select></label><label>负责人 <span>输入姓名筛选</span><input id="assigneeQuery" list="assigneeOptions" placeholder="输入负责人姓名" autocomplete="off" required><input id="assignee" type="hidden"><datalist id="assigneeOptions"></datalist></label></div><div class="section-label">云效协作人</div><div class="grid"><label>验证者 <span>可选，输入姓名选择</span><input id="verifierQuery" list="verifierOptions" placeholder="输入验证者姓名" autocomplete="off"><input id="verifier" type="hidden"><datalist id="verifierOptions"></datalist></label><label>参与者 <span>单选</span><select id="participants"></select></label></div><div class="section-label">路由与补充</div><label>模块<input id="module" placeholder="例如：订单中心"></label><label>测试说明<textarea id="note" placeholder="补充环境、测试账号或其他线索"></textarea></label><div class="savebar"><button>保存本地草稿</button><button type="button" class="submit-yunxiao" id="submitYunxiao">提交到云效</button><span class="saved" id="saved"></span></div></form><div class="panel welcome" id="hint"><div><div class="welcome-icon">✦</div><h2>从一条捕获开始</h2><p>选择左侧记录，依据录像、截图和日志补全缺陷草稿。保存后可随时继续编辑。</p></div></div></section></main>
 <script>
 let activeFolder='',activeDraft=null,yunxiaoOptions=null,yunxiaoAvailable=true;
 const $=id=>document.getElementById(id);
@@ -480,18 +507,20 @@ async function loadConnection(){const state=$('connectionState');state.textConte
 function evidence(p){return '/evidence/'+encodeURIComponent(activeFolder)+'/'+p.split('/').map(encodeURIComponent).join('/')}
 function badges(c){
   if(c.status==='in_progress')return [{label:c.progress?.label||'正在处理',kind:'pending'}];
+  const yunxiaoStatus={submitted:{label:'已提交到云效',kind:'yunxiao'},submitting:{label:'提交到云效中',kind:'submitting'},submission_failed:{label:'云效提交失败',kind:'failed'}}[c.yunxiaoStatus]||{label:'未提交云效',kind:'pending'};
   return [
     {label:c.draftStatus==='confirmed_locally'?'已保存':'待完善',kind:c.draftStatus==='confirmed_locally'?'':'pending'},
-    {label:c.yunxiaoStatus==='submitted'?'已提交到云效':'未提交云效',kind:c.yunxiaoStatus==='submitted'?'yunxiao':'pending'}
+    yunxiaoStatus
   ];
 }
 function isReady(c){return c.status!=='in_progress'}
 function optionLabel(item){return item.name+(item.role?' · '+item.role:'')}
 function addAutocompleteOptions(id,items){$(id).innerHTML=items.map(item=>'<option value="'+esc(optionLabel(item))+'"></option>').join('')}
 function matchOption(items,text){return items.find(item=>optionLabel(item)===text)||null}
-function setAutocomplete(kind,id){const items=yunxiaoOptions?.[kind]||[];const item=items.find(item=>item.id===id);$(kind==='applications'?'application':'assignee').value=item?.id||'';$(kind==='applications'?'applicationQuery':'assigneeQuery').value=item?optionLabel(item):''}
+function setAutocomplete(kind,id){const items=yunxiaoOptions?.[kind]||[];const target={applications:['application','applicationQuery'],assignees:['assignee','assigneeQuery'],verifiers:['verifier','verifierQuery']}[kind];if(!target)return;const item=items.find(item=>item.id===id);$(target[0]).value=item?.id||'';$(target[1]).value=item?optionLabel(item):''}
+function setParticipants(ids){const selected=new Set(ids||[]);$('participants').innerHTML=(yunxiaoOptions?.participants||[]).map(item=>'<option value="'+esc(item.id)+'"'+(selected.has(item.id)?' selected':'')+'>'+esc(optionLabel(item))+'</option>').join('')}
 function bindAutocomplete(queryId,hiddenId,kind){$(queryId).addEventListener('input',()=>{$(hiddenId).value='';});$(queryId).addEventListener('change',()=>{const item=matchOption(yunxiaoOptions?.[kind]||[],$(queryId).value);$(hiddenId).value=item?.id||'';});}
-async function loadYunxiaoOptions(){if(yunxiaoOptions)return yunxiaoOptions;const r=await fetch('/v1/yunxiao/options');if(!r.ok)throw new Error((await r.json()).error||'无法读取云效选项');yunxiaoOptions=await r.json();addAutocompleteOptions('applicationOptions',yunxiaoOptions.applications);addAutocompleteOptions('assigneeOptions',yunxiaoOptions.assignees);return yunxiaoOptions}
+async function loadYunxiaoOptions(){if(yunxiaoOptions)return yunxiaoOptions;const r=await fetch('/v1/yunxiao/options');if(!r.ok)throw new Error((await r.json()).error||'无法读取云效选项');yunxiaoOptions=await r.json();addAutocompleteOptions('applicationOptions',yunxiaoOptions.applications);addAutocompleteOptions('assigneeOptions',yunxiaoOptions.assignees);addAutocompleteOptions('verifierOptions',yunxiaoOptions.verifiers);return yunxiaoOptions}
 async function load(){
   const r=await fetch('/v1/captures');const d=await r.json();$('count').textContent=d.captures.length+' 条';
   $('list').innerHTML=d.captures.length?d.captures.map(c=>'<article class="capture'+(activeFolder===c.directory?' active':'')+(isReady(c)?'':' processing')+'" data-folder="'+esc(c.directory)+'"><div class="capture-title">'+esc(c.title)+'</div><div class="capture-meta"><div class="capture-tags">'+badges(c).map(item=>'<span class="tag '+item.kind+'">'+esc(item.label)+'</span>').join('')+'</div><span class="capture-directory">'+esc(c.directory)+'</span></div></article>').join(''):'<div class="empty">还没有完成的捕获记录。</div>';
@@ -501,13 +530,13 @@ async function openDraft(folder){
   const r=await fetch('/v1/captures/'+encodeURIComponent(folder)+'/draft');if(!r.ok){alert('此捕获还没有准备好草稿，请稍后重试。');return}
   try{await loadYunxiaoOptions();yunxiaoAvailable=true}catch(_){yunxiaoAvailable=false}
   activeFolder=folder;activeDraft=await r.json();$('editor').hidden=false;$('hint').hidden=true;$('heading').textContent=activeDraft.title||'缺陷草稿';$('meta').textContent=activeDraft.environment.deviceModel+'  ·  '+activeDraft.environment.packageName+'  ·  '+activeDraft.environment.triggeredAt;
-  $('title').value=activeDraft.title||'';$('steps').value=(activeDraft.reproductionSteps||[]).join('\n');$('expected').value=activeDraft.expectedResult||'';$('actual').value=activeDraft.actualResult||'';$('severity').value=activeDraft.severity||'';setAutocomplete('applications',activeDraft.application||'');$('module').value=activeDraft.module||'';setAutocomplete('assignees',activeDraft.assigneeId||'');$('note').value=activeDraft.testerNote||'';$('applicationQuery').disabled=!yunxiaoAvailable;$('assigneeQuery').disabled=!yunxiaoAvailable;$('submitYunxiao').disabled=!yunxiaoAvailable;$('submitYunxiao').title=yunxiaoAvailable?'':'请先完成云效配置';if(!yunxiaoAvailable){$('applicationQuery').value=activeDraft.application||'未配置';$('assigneeQuery').value=activeDraft.assignee||'未配置';$('saved').textContent='云效尚未配置：可继续保存本地草稿';}else $('saved').textContent='';$('video').href=evidence(activeDraft.technicalEvidence.replay);$('shot').href=evidence(activeDraft.technicalEvidence.screenshot);$('logs').href=evidence(activeDraft.technicalEvidence.logcat);load();
+  const fixedCollaborators=yunxiaoOptions?.fixedCollaborators||{};const verifierId=fixedCollaborators.verifierId||activeDraft.verifierId||'';const participantIds=fixedCollaborators.participantIds?.length?fixedCollaborators.participantIds:(activeDraft.participantIds||[]);$('title').value=activeDraft.title||'';$('steps').value=(activeDraft.reproductionSteps||[]).join('\n');$('expected').value=activeDraft.expectedResult||'';$('actual').value=activeDraft.actualResult||'';$('severity').value=activeDraft.severity||'';setAutocomplete('applications',activeDraft.application||'');$('module').value=activeDraft.module||'';setAutocomplete('assignees',activeDraft.assigneeId||'');setAutocomplete('verifiers',verifierId);setParticipants(participantIds);$('note').value=activeDraft.testerNote||'';$('applicationQuery').disabled=!yunxiaoAvailable;$('assigneeQuery').disabled=!yunxiaoAvailable;$('verifierQuery').disabled=!yunxiaoAvailable||Boolean(fixedCollaborators.verifierId);$('participants').disabled=!yunxiaoAvailable||Boolean(fixedCollaborators.participantIds?.length);$('submitYunxiao').disabled=!yunxiaoAvailable;$('submitYunxiao').title=yunxiaoAvailable?'':'请先完成云效配置';if(!yunxiaoAvailable){$('applicationQuery').value=activeDraft.application||'未配置';$('assigneeQuery').value=activeDraft.assignee||'未配置';$('saved').textContent='云效尚未配置：可继续保存本地草稿';}else $('saved').textContent='';$('video').href=evidence(activeDraft.technicalEvidence.replay);$('shot').href=evidence(activeDraft.technicalEvidence.screenshot);$('logs').href=evidence(activeDraft.technicalEvidence.logcat);load();
 }
-bindAutocomplete('applicationQuery','application','applications');bindAutocomplete('assigneeQuery','assignee','assignees');
-function currentDraft(){const application=matchOption(yunxiaoOptions?.applications||[],$('applicationQuery').value);const assignee=matchOption(yunxiaoOptions?.assignees||[],$('assigneeQuery').value);if(yunxiaoAvailable&&!application){alert('请从联想列表中选择应用。');$('applicationQuery').focus();return null}if(yunxiaoAvailable&&!assignee){alert('请从联想列表中选择负责人。');$('assigneeQuery').focus();return null}$('application').value=application?.id||activeDraft.application||'';$('assignee').value=assignee?.id||activeDraft.assigneeId||'';return {title:$('title').value.trim(),reproductionSteps:$('steps').value.split('\n').map(x=>x.trim()).filter(Boolean),expectedResult:$('expected').value.trim(),actualResult:$('actual').value.trim(),severity:$('severity').value,application:application?.id||activeDraft.application||'',module:$('module').value.trim(),assigneeId:assignee?.id||activeDraft.assigneeId||'',assignee:assignee?.name||activeDraft.assignee||'',testerNote:$('note').value.trim()}}
+bindAutocomplete('applicationQuery','application','applications');bindAutocomplete('assigneeQuery','assignee','assignees');bindAutocomplete('verifierQuery','verifier','verifiers');
+function currentDraft(){const application=matchOption(yunxiaoOptions?.applications||[],$('applicationQuery').value);const assignee=matchOption(yunxiaoOptions?.assignees||[],$('assigneeQuery').value);const verifier=matchOption(yunxiaoOptions?.verifiers||[],$('verifierQuery').value);const participantIds=Array.from($('participants').selectedOptions).map(option=>option.value);const participants=(yunxiaoOptions?.participants||[]).filter(person=>participantIds.includes(person.id));if(yunxiaoAvailable&&!application){alert('请从联想列表中选择应用。');$('applicationQuery').focus();return null}if(yunxiaoAvailable&&!assignee){alert('请从联想列表中选择负责人。');$('assigneeQuery').focus();return null}if(yunxiaoAvailable&&$('verifierQuery').value&&!verifier){alert('请从联想列表中选择验证者。');$('verifierQuery').focus();return null}$('application').value=application?.id||activeDraft.application||'';$('assignee').value=assignee?.id||activeDraft.assigneeId||'';$('verifier').value=verifier?.id||'';return {title:$('title').value.trim(),reproductionSteps:$('steps').value.split('\n').map(x=>x.trim()).filter(Boolean),expectedResult:$('expected').value.trim(),actualResult:$('actual').value.trim(),severity:$('severity').value,application:application?.id||activeDraft.application||'',module:$('module').value.trim(),assigneeId:assignee?.id||activeDraft.assigneeId||'',assignee:assignee?.name||activeDraft.assignee||'',verifierId:verifier?.id||'',verifier:verifier?.name||'',participantIds,participants:participants.map(person=>person.name),testerNote:$('note').value.trim()}}
 async function saveCurrentDraft(){const body=currentDraft();if(!body)return null;const r=await fetch('/v1/captures/'+encodeURIComponent(activeFolder)+'/draft',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const data=await r.json();if(!r.ok)throw new Error(data.error||'保存失败，请检查 Collector 是否仍在运行。');activeDraft=data.draft;$('saved').textContent='✓ 已保存于 '+new Date().toLocaleTimeString();$('heading').textContent=body.title||'缺陷草稿';await load();return data.draft}
 $('editor').onsubmit=async e=>{e.preventDefault();try{await saveCurrentDraft()}catch(error){alert(error.message)}};
-$('submitYunxiao').onclick=async()=>{if(!activeFolder)return;const button=$('submitYunxiao');button.disabled=true;button.textContent='保存中…';try{const savedDraft=await saveCurrentDraft();if(!savedDraft)return;const isUpdate=savedDraft.submission?.state==='submitted';if(!confirm(isUpdate?'将用当前最新内容更新已创建的云效缺陷，是否继续？':'将用当前最新内容创建一条真实云效缺陷，是否继续？'))return;button.textContent=isUpdate?'更新中…':'提交中…';const r=await fetch('/v1/captures/'+encodeURIComponent(activeFolder)+'/draft?action=submit-yunxiao',{method:'POST'});const data=await r.json();if(!r.ok)throw new Error(data.error||'云效提交失败');activeDraft.submission=data.submission;$('saved').textContent=data.action==='updated'?'✓ 云效缺陷已更新为最新版本':'✓ 已提交到云效';alert(data.action==='updated'?'云效缺陷已更新为当前最新内容。':'已成功创建云效缺陷。');load()}catch(error){alert('云效同步失败：'+error.message)}finally{button.disabled=false;button.textContent='提交到云效'}};
+$('submitYunxiao').onclick=async()=>{if(!activeFolder)return;const button=$('submitYunxiao');button.disabled=true;button.textContent='保存中…';try{const savedDraft=await saveCurrentDraft();if(!savedDraft)return;const isUpdate=savedDraft.submission?.state==='submitted';button.textContent=isUpdate?'更新中…':'提交中…';$('saved').textContent=isUpdate?'正在更新云效缺陷…':'正在提交到云效…';const request=fetch('/v1/captures/'+encodeURIComponent(activeFolder)+'/draft?action=submit-yunxiao',{method:'POST'});await new Promise(resolve=>setTimeout(resolve,150));load();const r=await request;const data=await r.json();if(!r.ok)throw new Error(data.error||'云效提交失败');activeDraft.submission=data.submission;$('saved').textContent=data.action==='updated'?'✓ 云效缺陷已更新为最新版本':'✓ 已提交到云效';load()}catch(error){$('saved').textContent='云效提交失败：'+error.message;load()}finally{button.disabled=false;button.textContent='提交到云效'}};
 $('refreshConnection').onclick=loadConnection;
 load();loadConnection();setInterval(load,1000);setInterval(loadConnection,10000);
 </script></html>`;
@@ -518,6 +547,7 @@ async function main() {
   if (command !== 'start') { usage(); process.exitCode = 1; return; }
   const config = options(rest);
   if (!config.serial || !config.packageName) { usage(); process.exitCode = 1; return; }
+  validateRuntimeEnvironment();
   const collector = new Collector(config);
   process.on('SIGINT', async () => { await collector.stop(); process.exit(0); });
   process.on('SIGTERM', async () => { await collector.stop(); process.exit(0); });

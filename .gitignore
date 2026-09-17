@@ -1,5 +1,4 @@
 .gradle/
 **/build/
 local.properties
-collector-data/
 collector/yunxiao.config.json

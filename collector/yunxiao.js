@@ -1,7 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 
-const CONFIG_PATH = path.resolve(__dirname, '..', 'collector-data', 'yunxiao.config.json');
+const CONFIG_PATH = path.resolve(__dirname, '..', '..', 'collector-data', 'yunxiao.config.json');
 const REQUIRED = ['domain', 'edition', 'spaceId', 'workitemTypeId', 'assignedTo'];
 let optionsCache = { expiresAt: 0, value: null };
 
@@ -52,6 +52,8 @@ function evidenceDescription(draft) {
     `- 严重程度：${draft.severity || '待确认'}`,
     `- 模块：${draft.module || '待确认'}`,
     `- 指派人/小组：${draft.assignee || '待确认'}`,
+    `- 验证者：${draft.verifier || '待确认'}`,
+    `- 参与者：${(draft.participants || []).join('、') || '待确认'}`,
     `- 测试说明：${draft.testerNote || '无'}`
   ].join('\n');
 }
@@ -60,6 +62,16 @@ function apiBase(config) {
   const domain = String(config.domain).replace(/^https?:\/\//, '').replace(/\/$/, '');
   const orgPrefix = config.edition === 'center' ? `/oapi/v1/projex/organizations/${encodeURIComponent(config.organizationId)}` : '/oapi/v1/projex';
   return { domain, orgPrefix };
+}
+
+function collaborators(config, draft) {
+  const defaults = config.defaults || {};
+  return {
+    verifierId: defaults.verifierId || draft.verifierId || '',
+    participantIds: Array.isArray(defaults.participantIds) && defaults.participantIds.length
+      ? defaults.participantIds
+      : (draft.participantIds || [])
+  };
 }
 
 async function apiGet(config, token, suffix) {
@@ -86,9 +98,16 @@ async function listProjectOptions() {
     const person = assigneeMap.get(member.userId);
     if (member.roleName && !person.roles.includes(member.roleName)) person.roles.push(member.roleName);
   }
+  const people = [...assigneeMap.values()].map(person => ({ id: person.id, name: person.name, role: person.roles.join(' / ') }));
   const value = {
     applications: (appField?.options || []).map(option => ({ id: option.id, name: option.displayValue || option.value })),
-    assignees: [...assigneeMap.values()].map(person => ({ id: person.id, name: person.name, role: person.roles.join(' / ') }))
+    assignees: people,
+    verifiers: people,
+    participants: people,
+    fixedCollaborators: {
+      verifierId: config.defaults?.verifierId || null,
+      participantIds: config.defaults?.participantIds || []
+    }
   };
   optionsCache = { value, expiresAt: Date.now() + 5 * 60_000 };
   return value;
@@ -99,6 +118,7 @@ async function createWorkitem(draft) {
   const unresolved = missing.filter(item => item !== 'assignedTo' || !draft.assigneeId);
   if (unresolved.length) throw new Error(`云效配置尚未完成：${unresolved.join('、')}`);
   if (!draft.application) throw new Error('请选择云效必填字段“应用”。');
+  const fixedCollaborators = collaborators(config, draft);
   if (!['center', 'region'].includes(config.edition)) throw new Error('edition 只能是 center 或 region');
   const domain = String(config.domain).replace(/^https?:\/\//, '').replace(/\/$/, '');
   const endpoint = config.edition === 'center'
@@ -114,6 +134,8 @@ async function createWorkitem(draft) {
       spaceId: config.spaceId,
       workitemTypeId: config.workitemTypeId,
       assignedTo: draft.assigneeId || config.assignedTo,
+      ...(fixedCollaborators.verifierId ? { verifier: fixedCollaborators.verifierId } : {}),
+      ...(fixedCollaborators.participantIds.length ? { participants: fixedCollaborators.participantIds } : {}),
       customFieldValues: {
         priority: config.defaults?.priority,
         seriousLevel: config.defaults?.seriousLevel?.[draft.severity || '一般'] || config.defaults?.seriousLevel?.['一般'],
@@ -140,6 +162,7 @@ async function updateWorkitem(draft) {
   const unresolved = missing.filter(item => item !== 'assignedTo' || !draft.assigneeId);
   if (unresolved.length) throw new Error(`云效配置尚未完成：${unresolved.join('、')}`);
   if (!draft.application) throw new Error('请选择云效必填字段“应用”。');
+  const fixedCollaborators = collaborators(config, draft);
   if (!['center', 'region'].includes(config.edition)) throw new Error('edition 只能是 center 或 region');
   const workitemId = submittedWorkitemId(draft.submission);
   if (!workitemId) throw new Error('本地记录缺少已提交的云效缺陷 ID，无法安全更新。');
@@ -155,6 +178,8 @@ async function updateWorkitem(draft) {
       description: evidenceDescription(draft),
       formatType: 'MARKDOWN',
       assignedTo: draft.assigneeId || config.assignedTo,
+      ...(fixedCollaborators.verifierId ? { verifier: fixedCollaborators.verifierId } : {}),
+      ...(fixedCollaborators.participantIds.length ? { participants: fixedCollaborators.participantIds } : {}),
       priority: config.defaults?.priority,
       seriousLevel: config.defaults?.seriousLevel?.[draft.severity || '一般'] || config.defaults?.seriousLevel?.['一般'],
       'a824eb4ad3fa91804c759badd9': draft.application,
