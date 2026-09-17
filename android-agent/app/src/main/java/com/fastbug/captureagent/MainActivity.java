@@ -142,4 +142,3 @@ public class MainActivity extends Activity {
                 + "\n录屏文件：Android/data/" + getPackageName() + "/files/Movies/fastbug/");
     }
 }
-
