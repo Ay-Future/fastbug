@@ -8,6 +8,7 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.graphics.Color;
+import android.graphics.drawable.GradientDrawable;
 import android.graphics.PixelFormat;
 import android.hardware.display.DisplayManager;
 import android.hardware.display.VirtualDisplay;
@@ -25,7 +26,9 @@ import android.os.IBinder;
 import android.os.Looper;
 import android.provider.Settings;
 import android.view.Gravity;
+import android.view.MotionEvent;
 import android.view.View;
+import android.view.ViewConfiguration;
 import android.view.WindowManager;
 import android.widget.TextView;
 
@@ -67,6 +70,9 @@ public class CaptureService extends Service {
     private PendingCapture pending;
     private WindowManager windowManager;
     private View overlay;
+    private TextView overlayLabel;
+    private WindowManager.LayoutParams overlayParams;
+    private final Runnable resetOverlayRunnable = () -> showIdleOverlay();
 
     private final Runnable rollRunnable = new Runnable() {
         @Override public void run() {
@@ -176,6 +182,7 @@ public class CaptureService extends Service {
         if (!running) return;
         if (pending != null) {
             updateState("采集中", "上一次捕获尚在收尾，请稍后再试。");
+            showSavingOverlay();
             return;
         }
         String captureId = "cap_" + UUID.randomUUID().toString().replace("-", "");
@@ -188,6 +195,7 @@ public class CaptureService extends Service {
         File current = finishCurrentSegment();
         if (current != null && current.exists()) pending.files.add(current);
         updateState("封存中", "已触发 " + captureId + "，正在额外录制约 10 秒。");
+        showSavingOverlay();
         startSegment("post_" + captureId + ".mp4", true);
         handler.postDelayed(() -> completeCapture(captureId), SEGMENT_MS);
     }
@@ -202,11 +210,16 @@ public class CaptureService extends Service {
         startRegularSegment();
         network.execute(() -> {
             File replay = remuxVideo(completed.files, new File(recordingDir(), "replay_" + completed.captureId + ".mp4"));
-            postReady(completed, replay);
+            boolean delivered = postReady(completed, replay);
             synchronized (CaptureService.this) {
                 if (pending == completed) pending = null;
             }
-            updateState("采集中", "证据已封存并通知 Collector：" + captureId);
+            if (delivered) {
+                updateState("采集中", "证据已封存并通知 Collector：" + captureId);
+                handler.post(this::showSavedOverlay);
+            } else {
+                handler.post(this::showTransferFailedOverlay);
+            }
         });
     }
 
@@ -233,7 +246,8 @@ public class CaptureService extends Service {
                 connection.setRequestProperty("Content-Type", "application/json");
                 connection.setDoOutput(true);
                 try (OutputStream out = connection.getOutputStream()) { out.write(body.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8)); }
-                connection.getResponseCode();
+                int status = connection.getResponseCode();
+                if (status < 200 || status >= 300) throw new IOException("Collector 返回 HTTP " + status);
                 connection.disconnect();
             } catch (Exception e) {
                 updateState("采集中", "Collector 通知失败：" + e.getMessage());
@@ -241,7 +255,7 @@ public class CaptureService extends Service {
         });
     }
 
-    private void postReady(PendingCapture completed, File replay) {
+    private boolean postReady(PendingCapture completed, File replay) {
         String collector = prefs().getString("collector_url", "http://127.0.0.1:52741");
         String session = prefs().getString("session_id", "");
         try {
@@ -262,10 +276,13 @@ public class CaptureService extends Service {
             connection.setRequestProperty("Content-Type", "application/json");
             connection.setDoOutput(true);
             try (OutputStream out = connection.getOutputStream()) { out.write(body.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8)); }
-            connection.getResponseCode();
+            int status = connection.getResponseCode();
             connection.disconnect();
+            if (status < 200 || status >= 300) throw new IOException("Collector 返回 HTTP " + status);
+            return true;
         } catch (Exception e) {
-            updateState("采集中", "Collector 证据通知失败：" + e.getMessage());
+            updateState("传输失败", "录像已封存在平板，但未传到电脑：" + e.getMessage());
+            return false;
         }
     }
 
@@ -337,25 +354,151 @@ public class CaptureService extends Service {
         if (!Settings.canDrawOverlays(this) || overlay != null) return;
         windowManager = (WindowManager) getSystemService(WINDOW_SERVICE);
         TextView button = new TextView(this);
-        button.setText("报缺陷");
-        button.setTextColor(Color.WHITE);
-        button.setTextSize(16);
         button.setGravity(Gravity.CENTER);
-        button.setPadding(28, 18, 28, 18);
-        button.setBackgroundColor(Color.rgb(198, 40, 40));
+        button.setTextAlignment(View.TEXT_ALIGNMENT_CENTER);
+        button.setLineSpacing(dp(2), 1f);
+        button.setPadding(dp(18), dp(12), dp(18), dp(12));
+        button.setElevation(dp(10));
         button.setOnClickListener(v -> triggerCapture());
+        configureDrag(button);
         WindowManager.LayoutParams params = new WindowManager.LayoutParams(
                 WindowManager.LayoutParams.WRAP_CONTENT, WindowManager.LayoutParams.WRAP_CONTENT,
                 Build.VERSION.SDK_INT >= 26 ? WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY : WindowManager.LayoutParams.TYPE_PHONE,
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE, PixelFormat.TRANSLUCENT);
-        params.gravity = Gravity.END | Gravity.CENTER_VERTICAL;
-        try { windowManager.addView(button, params); overlay = button; }
+        params.gravity = Gravity.TOP | Gravity.START;
+        params.x = prefs().getInt("overlay_x", screenWidth() - dp(100));
+        params.y = prefs().getInt("overlay_y", screenHeight() / 2 - dp(40));
+        overlayParams = params;
+        try {
+            windowManager.addView(button, params);
+            overlay = button;
+            overlayLabel = button;
+            showIdleOverlay();
+        }
         catch (Exception e) { updateState("采集中", "悬浮窗不可用：" + e.getMessage()); }
     }
+
+    private void configureDrag(View button) {
+        final int touchSlop = ViewConfiguration.get(this).getScaledTouchSlop();
+        button.setOnTouchListener(new View.OnTouchListener() {
+            private float downRawX;
+            private float downRawY;
+            private int downX;
+            private int downY;
+            private boolean dragging;
+
+            @Override public boolean onTouch(View view, MotionEvent event) {
+                if (overlayParams == null || windowManager == null) return false;
+                switch (event.getActionMasked()) {
+                    case MotionEvent.ACTION_DOWN:
+                        downRawX = event.getRawX();
+                        downRawY = event.getRawY();
+                        downX = overlayParams.x;
+                        downY = overlayParams.y;
+                        dragging = false;
+                        handler.removeCallbacks(resetOverlayRunnable);
+                        return true;
+                    case MotionEvent.ACTION_MOVE:
+                        float dx = event.getRawX() - downRawX;
+                        float dy = event.getRawY() - downRawY;
+                        if (!dragging && Math.hypot(dx, dy) > touchSlop) dragging = true;
+                        if (dragging) {
+                            overlayParams.x = clamp(downX + Math.round(dx), 0, screenWidth() - overlayWidth(view));
+                            overlayParams.y = clamp(downY + Math.round(dy), dp(24), screenHeight() - overlayHeight(view) - dp(24));
+                            updateOverlayLayout();
+                        }
+                        return true;
+                    case MotionEvent.ACTION_UP:
+                    case MotionEvent.ACTION_CANCEL:
+                        if (dragging) {
+                            snapOverlayToEdge(view);
+                            if (pending == null) handler.postDelayed(resetOverlayRunnable, 600L);
+                        } else if (event.getActionMasked() == MotionEvent.ACTION_UP) {
+                            view.performClick();
+                        }
+                        return true;
+                    default:
+                        return true;
+                }
+            }
+        });
+    }
+
+    private void snapOverlayToEdge(View view) {
+        int maxX = Math.max(0, screenWidth() - overlayWidth(view));
+        overlayParams.x = overlayParams.x + overlayWidth(view) / 2 < screenWidth() / 2 ? 0 : maxX;
+        overlayParams.y = clamp(overlayParams.y, dp(24), screenHeight() - overlayHeight(view) - dp(24));
+        prefs().edit().putInt("overlay_x", overlayParams.x).putInt("overlay_y", overlayParams.y).apply();
+        updateOverlayLayout();
+    }
+
+    private void updateOverlayLayout() {
+        if (windowManager != null && overlay != null && overlayParams != null) {
+            try { windowManager.updateViewLayout(overlay, overlayParams); } catch (Exception ignored) {}
+        }
+    }
+
+    private void showIdleOverlay() {
+        if (overlayLabel == null) return;
+        overlayLabel.setText("报缺陷");
+        overlayLabel.setTextColor(Color.WHITE);
+        overlayLabel.setTextSize(15);
+        overlayLabel.setAlpha(0.84f);
+        overlayLabel.setBackground(overlayBackground(Color.rgb(218, 59, 70), Color.argb(125, 255, 255, 255)));
+    }
+
+    private void showSavingOverlay() {
+        if (overlayLabel == null) return;
+        handler.removeCallbacks(resetOverlayRunnable);
+        overlayLabel.setText("●  正在封存\n请稍候…");
+        overlayLabel.setTextColor(Color.WHITE);
+        overlayLabel.setTextSize(15);
+        overlayLabel.setAlpha(0.92f);
+        overlayLabel.setBackground(overlayBackground(Color.rgb(239, 143, 48), Color.argb(145, 255, 255, 255)));
+    }
+
+    private void showSavedOverlay() {
+        if (overlayLabel == null) return;
+        overlayLabel.setText("✓  已封存\n继续采集中");
+        overlayLabel.setTextColor(Color.WHITE);
+        overlayLabel.setTextSize(15);
+        overlayLabel.setAlpha(0.9f);
+        overlayLabel.setBackground(overlayBackground(Color.rgb(44, 166, 125), Color.argb(145, 255, 255, 255)));
+        handler.removeCallbacks(resetOverlayRunnable);
+        handler.postDelayed(resetOverlayRunnable, 2_500L);
+    }
+
+    private void showTransferFailedOverlay() {
+        if (overlayLabel == null) return;
+        overlayLabel.setText("!  传输失败\n请检查电脑连接");
+        overlayLabel.setTextColor(Color.WHITE);
+        overlayLabel.setTextSize(15);
+        overlayLabel.setAlpha(0.92f);
+        overlayLabel.setBackground(overlayBackground(Color.rgb(190, 57, 67), Color.argb(145, 255, 255, 255)));
+        handler.removeCallbacks(resetOverlayRunnable);
+        handler.postDelayed(resetOverlayRunnable, 4_000L);
+    }
+
+    private GradientDrawable overlayBackground(int fill, int stroke) {
+        GradientDrawable drawable = new GradientDrawable();
+        drawable.setColor(fill);
+        drawable.setCornerRadius(dp(22));
+        drawable.setStroke(dp(1), stroke);
+        return drawable;
+    }
+
+    private int screenWidth() { return getResources().getDisplayMetrics().widthPixels; }
+    private int screenHeight() { return getResources().getDisplayMetrics().heightPixels; }
+    private int overlayWidth(View view) { return Math.max(view.getWidth(), dp(100)); }
+    private int overlayHeight(View view) { return Math.max(view.getHeight(), dp(52)); }
+    private int clamp(int value, int min, int max) { return Math.max(min, Math.min(Math.max(min, max), value)); }
+    private int dp(int value) { return Math.round(value * getResources().getDisplayMetrics().density); }
 
     private void removeOverlay() {
         if (windowManager != null && overlay != null) { try { windowManager.removeView(overlay); } catch (Exception ignored) {} }
         overlay = null;
+        overlayLabel = null;
+        overlayParams = null;
     }
 
     private synchronized void stopCapture(String reason) {

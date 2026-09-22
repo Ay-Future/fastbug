@@ -69,6 +69,7 @@ class Collector {
     this.captures = new Map();
     this.logProcess = null;
     this.deviceModel = 'unknown-device';
+    this.reverseTimer = null;
   }
 
   async start() {
@@ -80,7 +81,12 @@ class Collector {
     } catch (error) {
       console.warn(`Could not read device model; using fallback in evidence folder name: ${error.message}`);
     }
-    await adb(this.config.serial, ['reverse', `tcp:${this.config.port}`, `tcp:${this.config.port}`]);
+    await this.ensureReverse();
+    // USB reconnects and some device restarts clear adb reverse rules. Reapply the
+    // rule periodically so the Agent's localhost callback always reaches this PC.
+    this.reverseTimer = setInterval(() => {
+      this.ensureReverse().catch(error => console.error(`[adb reverse] ${error.message}`));
+    }, 10_000);
     this.startLogcat();
     this.server = http.createServer((req, res) => this.handle(req, res));
     await new Promise(resolve => this.server.listen(this.config.port, '127.0.0.1', resolve));
@@ -102,6 +108,9 @@ class Collector {
     });
     this.logProcess.stderr.on('data', chunk => console.error(`[logcat] ${chunk.toString().trim()}`));
     this.logProcess.on('exit', code => console.error(`[logcat] exited (${code}); collector remains available but logs will be incomplete.`));
+  }
+  async ensureReverse() {
+    await adb(this.config.serial, ['reverse', `tcp:${this.config.port}`, `tcp:${this.config.port}`], { timeout: 4_000 });
   }
   currentLogs() { return Buffer.concat(this.logChunks); }
 
@@ -457,6 +466,7 @@ class Collector {
   }
 
   async stop() {
+    if (this.reverseTimer) clearInterval(this.reverseTimer);
     if (this.logProcess) this.logProcess.kill();
     if (this.server) await new Promise(resolve => this.server.close(resolve));
   }
