@@ -52,11 +52,14 @@ import java.util.concurrent.Executors;
 public class CaptureService extends Service {
     public static final String ACTION_START = "com.fastbug.captureagent.START";
     public static final String ACTION_STOP = "com.fastbug.captureagent.STOP";
+    public static final String ACTION_RETRY_ARCHIVED = "com.fastbug.captureagent.RETRY_ARCHIVED";
     public static final String EXTRA_RESULT_CODE = "result_code";
     public static final String EXTRA_RESULT_DATA = "result_data";
     private static final int NOTIFICATION_ID = 41;
     private static final long SEGMENT_MS = 10_000L;
     private static final int RING_SEGMENTS = 6;
+    private static final long[] DELIVERY_RETRY_DELAYS_MS = {3_000L, 8_000L, 20_000L};
+    private static final String PENDING_REPORTS = "pending_reports";
 
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final ExecutorService network = Executors.newSingleThreadExecutor();
@@ -88,6 +91,10 @@ public class CaptureService extends Service {
         String action = intent == null ? null : intent.getAction();
         if (ACTION_STOP.equals(action)) {
             stopCapture("用户停止");
+            return START_NOT_STICKY;
+        }
+        if (ACTION_RETRY_ARCHIVED.equals(action)) {
+            retryArchivedCaptures(startId);
             return START_NOT_STICKY;
         }
         if (ACTION_START.equals(action)) {
@@ -210,17 +217,121 @@ public class CaptureService extends Service {
         startRegularSegment();
         network.execute(() -> {
             File replay = remuxVideo(completed.files, new File(recordingDir(), "replay_" + completed.captureId + ".mp4"));
-            boolean delivered = postReady(completed, replay);
+            savePendingDelivery(completed, replay);
+            boolean delivered = postReady(completed, replay, true);
             synchronized (CaptureService.this) {
                 if (pending == completed) pending = null;
             }
             if (delivered) {
+                removePendingDelivery(completed.captureId);
                 updateState("采集中", "证据已封存并通知 Collector：" + captureId);
                 handler.post(this::showSavedOverlay);
             } else {
                 handler.post(this::showTransferFailedOverlay);
+                scheduleDeliveryRetry(completed, replay, 0);
             }
         });
+    }
+
+    private void scheduleDeliveryRetry(PendingCapture completed, File replay, int attempt) {
+        if (attempt >= DELIVERY_RETRY_DELAYS_MS.length) return;
+        handler.postDelayed(() -> network.execute(() -> {
+            boolean triggerAccepted = postTriggeredRetry(completed);
+            boolean delivered = triggerAccepted && postReady(completed, replay, false);
+            if (delivered) {
+                removePendingDelivery(completed.captureId);
+                updateState("采集中", "连接恢复，证据已自动补传：" + completed.captureId);
+                handler.post(this::showSavedOverlay);
+            } else {
+                scheduleDeliveryRetry(completed, replay, attempt + 1);
+            }
+        }), DELIVERY_RETRY_DELAYS_MS[attempt]);
+    }
+
+    private void retryArchivedCaptures(int startId) {
+        network.execute(() -> {
+            JSONArray reports = pendingReports();
+            if (reports.length() == 0) {
+                updateState(running ? "采集中" : "无待补传记录", "没有需要主动上报的封存记录。");
+                if (!running) stopSelf(startId);
+                return;
+            }
+            updateState("补传中", "正在主动上报 " + reports.length() + " 条封存记录…");
+            for (int i = 0; i < reports.length(); i++) {
+                try {
+                    JSONObject item = reports.getJSONObject(i);
+                    String captureId = item.getString("captureId");
+                    File replay = new File(recordingDir(), item.getString("replayName"));
+                    if (!replay.exists() || replay.length() == 0) continue;
+                    PendingCapture capture = new PendingCapture(captureId, item.getLong("wallTime"),
+                            item.optLong("monotonicMs", 0L), new ArrayList<>());
+                    if (postTriggeredRetry(capture) && postReady(capture, replay, false)) removePendingDelivery(captureId);
+                } catch (Exception ignored) { }
+            }
+            int remaining = pendingReports().length();
+            if (remaining == 0) {
+                updateState(running ? "采集中" : "已补传", "封存记录已全部主动上报到电脑。");
+                handler.post(this::showSavedOverlay);
+            } else {
+                updateState("传输失败", "仍有 " + remaining + " 条封存记录等待电脑连接后补传。");
+                handler.post(this::showTransferFailedOverlay);
+            }
+            if (!running) stopSelf(startId);
+        });
+    }
+
+    private JSONArray pendingReports() {
+        try { return new JSONArray(prefs().getString(PENDING_REPORTS, "[]")); }
+        catch (Exception ignored) { return new JSONArray(); }
+    }
+
+    private void savePendingDelivery(PendingCapture capture, File replay) {
+        if (replay == null || !replay.exists() || replay.length() == 0) return;
+        JSONArray old = pendingReports();
+        JSONArray updated = new JSONArray();
+        for (int i = 0; i < old.length(); i++) {
+            try {
+                JSONObject item = old.getJSONObject(i);
+                if (!capture.captureId.equals(item.optString("captureId"))) updated.put(item);
+            } catch (Exception ignored) { }
+        }
+        try {
+            JSONObject item = new JSONObject();
+            item.put("captureId", capture.captureId);
+            item.put("wallTime", capture.wallTime);
+            item.put("monotonicMs", capture.monotonicMs);
+            item.put("replayName", replay.getName());
+            updated.put(item);
+            prefs().edit().putString(PENDING_REPORTS, updated.toString()).apply();
+        } catch (Exception ignored) { }
+    }
+
+    private void removePendingDelivery(String captureId) {
+        JSONArray old = pendingReports();
+        JSONArray updated = new JSONArray();
+        for (int i = 0; i < old.length(); i++) {
+            try {
+                JSONObject item = old.getJSONObject(i);
+                if (!captureId.equals(item.optString("captureId"))) updated.put(item);
+            } catch (Exception ignored) { }
+        }
+        prefs().edit().putString(PENDING_REPORTS, updated.toString()).apply();
+    }
+
+    private boolean postTriggeredRetry(PendingCapture completed) {
+        try {
+            JSONObject body = new JSONObject();
+            body.put("type", "triggered");
+            body.put("captureId", completed.captureId);
+            body.put("sessionId", prefs().getString("session_id", ""));
+            body.put("triggeredAtWallMs", completed.wallTime);
+            body.put("triggeredAtMonotonicMs", completed.monotonicMs);
+            postJson(body, 5_000);
+            return true;
+        } catch (Exception e) {
+            updateState("传输失败", "录像已封存在平板，等待连接恢复后自动补传：" + e.getMessage());
+            return false;
+        }
     }
 
     private void postEvent(String type, String captureId, long wallTime, long monotonicMs, List<File> files) {
@@ -255,8 +366,7 @@ public class CaptureService extends Service {
         });
     }
 
-    private boolean postReady(PendingCapture completed, File replay) {
-        String collector = prefs().getString("collector_url", "http://127.0.0.1:52741");
+    private boolean postReady(PendingCapture completed, File replay, boolean includeSegments) {
         String session = prefs().getString("session_id", "");
         try {
             JSONObject body = new JSONObject();
@@ -266,23 +376,31 @@ public class CaptureService extends Service {
             body.put("triggeredAtWallMs", completed.wallTime);
             body.put("triggeredAtMonotonicMs", completed.monotonicMs);
             JSONArray paths = new JSONArray();
-            for (File f : completed.files) paths.put(remotePath(f));
+            if (includeSegments) for (File f : completed.files) paths.put(remotePath(f));
             body.put("videoPaths", paths);
             if (replay != null && replay.exists() && replay.length() > 0) body.put("replayPath", remotePath(replay));
-            HttpURLConnection connection = (HttpURLConnection) new URL(collector + "/v1/events").openConnection();
+            postJson(body, 60_000); // Collector may pull several video files before replying.
+            return true;
+        } catch (Exception e) {
+            updateState("传输失败", "录像已封存在平板，但未传到电脑：" + e.getMessage());
+            return false;
+        }
+    }
+
+    private void postJson(JSONObject body, int readTimeoutMs) throws IOException {
+        String collector = prefs().getString("collector_url", "http://127.0.0.1:52741");
+        HttpURLConnection connection = (HttpURLConnection) new URL(collector + "/v1/events").openConnection();
+        try {
             connection.setConnectTimeout(3_000);
-            connection.setReadTimeout(60_000); // Collector may pull several video files before replying.
+            connection.setReadTimeout(readTimeoutMs);
             connection.setRequestMethod("POST");
             connection.setRequestProperty("Content-Type", "application/json");
             connection.setDoOutput(true);
             try (OutputStream out = connection.getOutputStream()) { out.write(body.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8)); }
             int status = connection.getResponseCode();
-            connection.disconnect();
             if (status < 200 || status >= 300) throw new IOException("Collector 返回 HTTP " + status);
-            return true;
-        } catch (Exception e) {
-            updateState("传输失败", "录像已封存在平板，但未传到电脑：" + e.getMessage());
-            return false;
+        } finally {
+            connection.disconnect();
         }
     }
 

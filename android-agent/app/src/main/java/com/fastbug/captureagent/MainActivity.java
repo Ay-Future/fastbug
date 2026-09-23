@@ -119,6 +119,12 @@ public class MainActivity extends Activity {
         overlay.setOnClickListener(v -> startActivity(new Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
                 Uri.parse("package:" + getPackageName()))));
         actions.addView(overlay, margin(-1, dp(48), 0, dp(10), 0, 0));
+        Button reportArchived = button("上报封存记录", SURFACE_LIGHT, TEXT);
+        reportArchived.setOnClickListener(v -> {
+            startService(new Intent(this, CaptureService.class).setAction(CaptureService.ACTION_RETRY_ARCHIVED));
+            updateStatus("正在补传", "正在主动上报已封存但尚未传到电脑的记录…");
+        });
+        actions.addView(reportArchived, margin(-1, dp(48), 0, dp(10), 0, 0));
         LinearLayout secondary = new LinearLayout(this);
         secondary.setGravity(Gravity.CENTER_VERTICAL);
         Button stop = button("停止采集", Color.TRANSPARENT, MUTED);
