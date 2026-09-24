@@ -1,3 +1,4 @@
+
 # FastBug POC
 
 安卓平板一键捕获缺陷的本地 POC：`android-agent` 负责录屏与浮窗触发，`collector` 通过 USB ADB 收集截图、日志和元数据，并生成本地证据包。
@@ -12,3 +13,4 @@
 4. 平板点击“报缺陷”。证据包位于项目同级目录 `../collector-data/captures/<capture_id>/`。
 
 只要 Agent 与 Collector 位于 USB ADB 反向映射链路中，不需要测试网络互通。
+
