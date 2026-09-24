@@ -2,3 +2,13 @@
 **/build/
 local.properties
 collector/yunxiao.config.json
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+.stderr.log
+.stdout.log
