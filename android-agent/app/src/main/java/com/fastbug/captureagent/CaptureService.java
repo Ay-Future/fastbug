@@ -222,8 +222,10 @@ public class CaptureService extends Service {
             synchronized (CaptureService.this) {
                 if (pending == completed) pending = null;
             }
+            resumeRollingSegments();
             if (delivered) {
                 removePendingDelivery(completed.captureId);
+                releaseDeliveredMedia(completed.files, replay);
                 updateState("采集中", "证据已封存并通知 Collector：" + captureId);
                 handler.post(this::showSavedOverlay);
             } else {
@@ -240,6 +242,7 @@ public class CaptureService extends Service {
             boolean delivered = triggerAccepted && postReady(completed, replay, false);
             if (delivered) {
                 removePendingDelivery(completed.captureId);
+                releaseDeliveredMedia(completed.files, replay);
                 updateState("采集中", "连接恢复，证据已自动补传：" + completed.captureId);
                 handler.post(this::showSavedOverlay);
             } else {
@@ -264,8 +267,11 @@ public class CaptureService extends Service {
                     File replay = new File(recordingDir(), item.getString("replayName"));
                     if (!replay.exists() || replay.length() == 0) continue;
                     PendingCapture capture = new PendingCapture(captureId, item.getLong("wallTime"),
-                            item.optLong("monotonicMs", 0L), new ArrayList<>());
-                    if (postTriggeredRetry(capture) && postReady(capture, replay, false)) removePendingDelivery(captureId);
+                            item.optLong("monotonicMs", 0L), archivedSourceFiles(item));
+                    if (postTriggeredRetry(capture) && postReady(capture, replay, false)) {
+                        removePendingDelivery(captureId);
+                        releaseDeliveredMedia(capture.files, replay);
+                    }
                 } catch (Exception ignored) { }
             }
             int remaining = pendingReports().length();
@@ -301,6 +307,11 @@ public class CaptureService extends Service {
             item.put("wallTime", capture.wallTime);
             item.put("monotonicMs", capture.monotonicMs);
             item.put("replayName", replay.getName());
+            JSONArray sourceFiles = new JSONArray();
+            for (File source : capture.files) {
+                if (source != null) sourceFiles.put(source.getName());
+            }
+            item.put("sourceFiles", sourceFiles);
             updated.put(item);
             prefs().edit().putString(PENDING_REPORTS, updated.toString()).apply();
         } catch (Exception ignored) { }
@@ -316,6 +327,53 @@ public class CaptureService extends Service {
             } catch (Exception ignored) { }
         }
         prefs().edit().putString(PENDING_REPORTS, updated.toString()).apply();
+    }
+
+    /** Restores the original segment names for an archived capture after an Agent restart. */
+    private List<File> archivedSourceFiles(JSONObject item) {
+        ArrayList<File> files = new ArrayList<>();
+        JSONArray names = item.optJSONArray("sourceFiles");
+        if (names == null) return files;
+        for (int i = 0; i < names.length(); i++) {
+            String name = names.optString(i, "");
+            if (name.isEmpty() || !name.equals(new File(name).getName())) continue;
+            files.add(new File(recordingDir(), name));
+        }
+        return files;
+    }
+
+    /**
+     * The Collector returns HTTP success only after it has pulled and finalized the evidence.
+     * At that point the device copy is no longer needed. Keeping failed deliveries is deliberate:
+     * those files are the source for the manual and automatic retry paths.
+     */
+    private synchronized void releaseDeliveredMedia(List<File> sourceFiles, File replay) {
+        for (File source : sourceFiles) {
+            ring.remove(source);
+            deleteQuietly(source);
+        }
+        deleteQuietly(replay);
+    }
+
+    private void deleteQuietly(File file) {
+        if (file != null && file.exists()) {
+            try { file.delete(); } catch (Exception ignored) { }
+        }
+    }
+
+    /**
+     * While a capture is being transferred, the regular roll callback intentionally waits so
+     * the evidence source list stays stable. Finish the temporary live segment once transfer
+     * handling completes; otherwise a slow USB pull could leave one recorder writing forever.
+     */
+    private void resumeRollingSegments() {
+        handler.post(() -> {
+            synchronized (CaptureService.this) {
+                if (!running || pending != null || currentFile == null) return;
+                finishCurrentSegment();
+                startRegularSegment();
+            }
+        });
     }
 
     private boolean postTriggeredRetry(PendingCapture completed) {
@@ -627,6 +685,9 @@ public class CaptureService extends Service {
         projection = null;
         if (activeProjection != null) { activeProjection.stop(); }
         removeOverlay();
+        // A capture still being finalized owns its source segments; leave those intact for retry.
+        // In the normal idle case the rolling buffer has no recovery value after recording stops.
+        if (pending == null) releaseDeliveredMedia(new ArrayList<>(ring), null);
         updateState("已停止", reason);
         stopForeground(STOP_FOREGROUND_REMOVE);
         stopSelf();
