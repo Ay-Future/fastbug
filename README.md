@@ -1,119 +1,122 @@
 # FastBug
 
+<p align="right">
+  <a href="README.md">English</a> | <a href="README.zh-CN.md">简体中文</a>
+</p>
 
-FastBug 是面向 Android 测试现场的本地证据采集工具：在平板上点击“报缺陷”，自动封存录像、截图、页面结构和日志；测试人员在电脑网页补全缺陷信息后，可提交至云效。
+FastBug is a local evidence-collection tool for Android test environments. Tap “Report Bug” on a tablet to automatically preserve video, screenshots, page structure, and logs. Testers can then complete the bug details in a desktop web page and submit the bug to Yunxiao.
 
-被测应用无需集成 SDK，也不需要与测试电脑处于同一网络。Android Agent 与 Windows Collector 通过 USB ADB 的 `reverse` 通道通信。
+The app under test does not need an SDK integration and does not need to be on the same network as the test computer. The Android Agent and Windows Collector communicate through the USB ADB `reverse` channel.
 
 ```mermaid
 flowchart LR
-    A[测试平板\nAndroid Agent] -->|USB ADB reverse| B[Windows Collector]
-    B --> C[本地证据目录]
+    A[Test tablet\nAndroid Agent] -->|USB ADB reverse| B[Windows Collector]
+    B --> C[Local evidence directory]
     C --> D[Dashboard]
-    D --> E[OSS 证据 ZIP]
-    D --> F[云效缺陷]
+    D --> E[OSS evidence ZIP]
+    D --> F[Yunxiao bug]
 ```
 
-## 能做什么
+## What it does
 
-- 保留触发前约 60 秒和触发后约 10 秒的屏幕录像；
-- 自动采集截图、UI XML、窗口状态、设备/应用信息和 logcat；
-- 在本地 Dashboard 查看证据、编辑和保存缺陷草稿；
-- 打包证据上传 OSS，并创建或更新云效缺陷；
-- 成功交付后自动清理平板录像；传输失败时支持自动与手动补传；
-- 清理从未保存的本地草稿及其完整证据目录。
+- Retains about 60 seconds of screen video before the trigger and about 10 seconds after it.
+- Automatically collects screenshots, UI XML, window state, device and app information, and logcat output.
+- Lets you view evidence and edit and save bug drafts in the local Dashboard.
+- Packages evidence for OSS upload, then creates or updates Yunxiao bugs.
+- Deletes tablet video automatically after successful delivery; supports automatic and manual retry when transfer fails.
+- Deletes unsaved local drafts together with their complete evidence directories.
 
-## 快速开始
+## Quick start
 
-### 1. 准备环境
+### 1. Prepare the environment
 
-- Windows：Node.js 18+、Android Platform Tools（`adb`）和 `tar.exe`；
-- Android 平板：开启 USB 调试，安装 FastBug Agent；
-- 可访问 OSS 与云效的网络；
-- 已配置云效和 OSS 凭据。
+- Windows: Node.js 18+, Android Platform Tools (`adb`), and `tar.exe`.
+- Android tablet: USB debugging enabled and FastBug Agent installed.
+- Network access to OSS and Yunxiao.
+- Configured Yunxiao and OSS credentials.
 
-确认设备已连接：
+Confirm that the device is connected:
 
 ```powershell
 adb devices
 ```
 
-设备状态必须为 `device`。
+The device status must be `device`.
 
-### 2. 配置凭据与云效项目
+### 2. Configure credentials and the Yunxiao project
 
-Collector 从 Windows **用户环境变量**读取以下必填项：
+The Collector reads these required values from Windows **user environment variables**:
 
 ```powershell
-[Environment]::SetEnvironmentVariable('YUNXIAO_TOKEN', '<云效访问令牌>', 'User')
-[Environment]::SetEnvironmentVariable('FASTBUG_OSS_ENDPOINT', '<OSS Endpoint>', 'User')
+[Environment]::SetEnvironmentVariable('YUNXIAO_TOKEN', '<Yunxiao access token>', 'User')
+[Environment]::SetEnvironmentVariable('FASTBUG_OSS_ENDPOINT', '<OSS endpoint>', 'User')
 [Environment]::SetEnvironmentVariable('FASTBUG_OSS_ACCESS_KEY_ID', '<OSS AccessKey ID>', 'User')
-[Environment]::SetEnvironmentVariable('FASTBUG_OSS_ACCESS_KEY_SECRET', '<OSS AccessKey Secret>', 'User')
+[Environment]::SetEnvironmentVariable('FASTBUG_OSS_ACCESS_KEY_SECRET', '<OSS AccessKey secret>', 'User')
 ```
 
-设置后重新打开 PowerShell。将模板复制并填写实际云效项目参数：
+Open a new PowerShell window after setting them. Copy the template and fill in the actual Yunxiao project parameters:
 
 ```powershell
 New-Item -ItemType Directory -Force ..\collector-data | Out-Null
 Copy-Item .\collector\yunxiao.config.example.json ..\collector-data\yunxiao.config.json
 ```
 
-真实凭据和 `collector/yunxiao.config.json` 不应提交到 Git。
+Do not commit real credentials or `collector/yunxiao.config.json` to Git.
 
-### 3. 启动 Collector
+### 3. Start the Collector
 
-在工程根目录执行：
+From the repository root, run:
 
 ```powershell
-.\collector\start.ps1 -Serial <设备序列号> -Package <被测应用包名>
+.\collector\start.ps1 -Serial <device serial number> -Package <app package name under test>
 ```
 
-Collector 启动后会输出一条 `adb shell am start ...` 命令。执行该命令即可自动将 Collector URL 和 Session ID 写入 Agent。
+After the Collector starts, it prints an `adb shell am start ...` command. Run that command to automatically write the Collector URL and Session ID to the Agent.
 
-### 4. 开始采集与提交
+### 4. Collect and submit
 
-1. 在平板 Agent 中授权悬浮窗，点击“开始采集”，并允许系统录屏；
-2. 在被测应用中点击悬浮“报缺陷”；
-3. 浏览器打开 `http://127.0.0.1:52741/`；
-4. 在“捕获记录”中查看证据，补全缺陷草稿并保存；
-5. 点击“提交至云效”。
+1. In the tablet Agent, grant overlay permission, tap “Start Capture,” and allow system screen recording.
+2. In the app under test, tap the floating “Report Bug” button.
+3. Open `http://127.0.0.1:52741/` in a browser.
+4. View evidence in “Capture Records,” complete and save the bug draft.
+5. Click “Submit to Yunxiao.”
 
-## 项目结构
+## Project structure
 
-| 路径 | 说明 |
+| Path | Description |
 | --- | --- |
-| `android-agent/` | Android Studio 工程：配置页、悬浮触发、滚动录屏和失败补传。 |
-| `collector/` | Node.js Collector：ADB 采集、本地服务、Dashboard、OSS 与云效集成。 |
-| `docs/` | 使用说明、实施计划和运维文档。 |
-| `../collector-data/` | 运行数据目录：云效配置、本地证据、草稿和 manifest；不在 Git 仓库中。 |
+| `android-agent/` | Android Studio project: configuration screen, floating trigger, rolling video capture, and retry after failure. |
+| `collector/` | Node.js Collector: ADB collection, local service, Dashboard, OSS, and Yunxiao integration. |
+| `docs/` | Usage instructions, implementation plan, and operations documentation. |
+| `../collector-data/` | Runtime data directory for Yunxiao configuration, local evidence, drafts, and manifests; it is outside the Git repository. |
 
-核心入口：
+Key entry points:
 
-- `android-agent/app/src/main/java/com/fastbug/captureagent/MainActivity.java`：Agent 控制页；
-- `android-agent/app/src/main/java/com/fastbug/captureagent/CaptureService.java`：录屏、封存、补传与设备端清理；
-- `collector/index.js`：Collector HTTP 服务和证据编排；
-- `collector/dashboard.js`：本地 Dashboard；
-- `collector/start.ps1`：Windows 启动入口。
+- `android-agent/app/src/main/java/com/fastbug/captureagent/MainActivity.java`: Agent control screen.
+- `android-agent/app/src/main/java/com/fastbug/captureagent/CaptureService.java`: video recording, preservation, retry, and device-side cleanup.
+- `collector/index.js`: Collector HTTP service and evidence orchestration.
+- `collector/dashboard.js`: local Dashboard.
+- `collector/start.ps1`: Windows launch entry point.
 
-## 证据留存
+## Evidence retention
 
-| 位置 | 留存策略 |
+| Location | Retention policy |
 | --- | --- |
-| 平板 | 采集时仅保留最近约 60 秒；本次证据成功传到 Collector 后自动删除；失败时保留用于补传。 |
-| 测试电脑 | 正式证据保存在 `D:\project\collector-data\captures\<capture-folder>\`，包括录像、截图、日志、manifest 和草稿。 |
-| OSS | 提交云效时上传完整 ZIP；签名下载链接有效期为 7 天。 |
+| Tablet | Only the most recent 60 seconds are retained during capture. The current evidence is deleted after successful transfer to the Collector; it is retained for retry if transfer fails. |
+| Test computer | Final evidence is stored in `D:\project\collector-data\captures\<capture-folder>\`, including video, screenshots, logs, manifests, and drafts. |
+| OSS | A complete ZIP is uploaded when the Yunxiao bug is submitted. The signed download link is valid for seven days. |
 
-“清理未保存”会永久删除尚未保存草稿的完整电脑侧证据目录，请谨慎使用。
+“Clear Unsaved” permanently deletes the complete computer-side evidence directory for drafts that have not been saved. Use it with care.
 
-## 安全与边界
+## Security and boundaries
 
-- Collector 只监听 `127.0.0.1`；
-- Agent 的明文 HTTP 仅用于 ADB reverse 下的本机回环通信；
-- 录像、截图、日志和 OSS 链接可能包含敏感业务信息，须按公司数据规范保存与分享；
-- 一个 Collector 实例对应一个设备、被测包名和 Session；多设备并行需要使用独立端口、Session 和实例。
+- The Collector listens only on `127.0.0.1`.
+- The Agent uses plaintext HTTP only for local loopback communication through ADB reverse.
+- Video, screenshots, logs, and OSS links may contain sensitive business information; store and share them according to your organization’s data policies.
+- One Collector instance is for one device, app package, and Session. To run multiple devices in parallel, use separate ports, Sessions, and instances.
 
-## 文档
+## Documentation
 
-- [完整使用方式与实现方案](docs/FastBug_使用方式与实现方案.md)
-- [项目启用准备说明](docs/项目启用准备说明.md)
-- [服务启动与重启说明](docs/服务启动与重启说明.md)
+- [Complete usage and implementation guide](docs/FastBug_使用方式与实现方案.md)
+- [Project enablement preparation guide](docs/项目启用准备说明.md)
+- [Service startup and restart guide](docs/服务启动与重启说明.md)
